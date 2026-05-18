@@ -12,20 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       with:
         submodules: recursive
+        persist-credentials: false
 
-    - name: Update submodules to latest main
-      run: git submodule update --remote
+    - name: Update submodules to pinned commits
+      run: git submodule update --init --recursive
 
     - name: Set up Helm
-      uses: azure/setup-helm@v4
+      uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4
       with:
         version: v3.17.0
 
     - name: Create Kind cluster
-      uses: helm/kind-action@v1
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
       with:
         cluster_name: osac-integration
 

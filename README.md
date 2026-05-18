@@ -85,13 +85,16 @@ target Hub cluster.
 
 ## Installation Strategy
 
-OSAC uses Kustomize for installation. This approach allows you to easily override and
-customize your deployment to meet specific needs. Multiple OSAC installations can be
-deployed on the same cluster, each in its own project namespace.
+OSAC supports two installation methods:
 
-To manage dependencies, the OSAC-installer repository uses Git submodules to import the
-required manifests from each component. This ensures component versions are pinned and
-compatible with the installer.
+- **Helm** (recommended) — Uses an umbrella Helm chart (`charts/osac/`) that composes
+  all OSAC component charts into a single deployable unit. Configuration is managed via
+  values files in the `values/` directory.
+- **Kustomize** (legacy) — Uses Kustomize overlays in the `overlays/` directory.
+
+Both methods use Git submodules to import component manifests from each repository.
+The prerequisites (cert-manager, AAP operator, Authorino, Keycloak, etc.) are the
+same regardless of which method you choose.
 
 ### Customizing Your Installation
 
@@ -260,33 +263,33 @@ The `scripts/setup.sh` script automates the entire installation process, includi
 - Installing prerequisite operators (cert-manager, trust-manager, Authorino, Keycloak, AAP)
 - Optionally installing LVMS (storage service), MetalLB (ingress service), Multicluster Engine (MCE + infrastructure operator), and OpenShift Virtualization (CNV)
 - Setting up the CA issuer and network attachment definitions
-- Applying the Kustomize overlay
+- Deploying OSAC components (via Helm or Kustomize)
 - Waiting for the AAP bootstrap job to complete
 - Creating the hub access kubeconfig and registering the hub with the fulfillment service
 
 To run the automated setup:
 
 ```bash
-# Using defaults (namespace: osac-devel, overlay: development)
+# Helm mode (default) — uses values/development.yaml
 $ ./scripts/setup.sh
 
-# Or customize the namespace and overlay
-$ INSTALLER_NAMESPACE=<project-name> INSTALLER_KUSTOMIZE_OVERLAY=<project-name> ./scripts/setup.sh
+# Or customize the namespace and values file
+$ INSTALLER_NAMESPACE=<project-name> VALUES_FILE=values/development.yaml ./scripts/setup.sh
+
+# Kustomize mode (legacy)
+$ DEPLOY_MODE=kustomize INSTALLER_KUSTOMIZE_OVERLAY=<project-name> ./scripts/setup.sh
 
 # Install with all optional services (storage, ingress, virtualization, MCE)
-$ EXTRA_SERVICES=true \
-    INSTALLER_NAMESPACE=<project-name> INSTALLER_KUSTOMIZE_OVERLAY=<project-name> ./scripts/setup.sh
-
-# Or selectively enable specific services
-$ INGRESS_SERVICE=true STORAGE_SERVICE=true \
-    INSTALLER_NAMESPACE=<project-name> INSTALLER_KUSTOMIZE_OVERLAY=<project-name> ./scripts/setup.sh
+$ EXTRA_SERVICES=true INSTALLER_NAMESPACE=<project-name> ./scripts/setup.sh
 ```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KUBECONFIG` | `~/.kube/config` | Path to the target cluster's kubeconfig file |
-| `INSTALLER_NAMESPACE` | from overlay | Target namespace for the OSAC deployment |
-| `INSTALLER_KUSTOMIZE_OVERLAY` | `development` | Kustomize overlay directory to use |
+| `DEPLOY_MODE` | `helm` | Deployment method: `helm` or `kustomize` |
+| `INSTALLER_NAMESPACE` | `osac` (helm) / from overlay (kustomize) | Target namespace for the OSAC deployment |
+| `VALUES_FILE` | `values/development.yaml` | Helm values file to use (helm mode only) |
+| `INSTALLER_KUSTOMIZE_OVERLAY` | `development` | Kustomize overlay directory (kustomize mode only) |
 | `EXTRA_SERVICES` | `false` | Enable all optional services (sets all below to `true`) |
 | `INGRESS_SERVICE` | `false` | Install MetalLB as the ingress/LoadBalancer service |
 | `STORAGE_SERVICE` | `false` | Install LVMS and create a default StorageClass (`lvms-vg1`) |
@@ -338,10 +341,152 @@ interface contract, and how to add a new provider.
 The script will wait for all components to be ready before proceeding to the next step.
 Once it completes successfully, OSAC is fully operational.
 
-### Option B: Manual Installation
+### Option B: Manual Helm Installation
 
-If you prefer to install step-by-step, or need to install individual prerequisites,
-follow the manual process below.
+If you prefer to install step-by-step, follow the process below. The prerequisites
+are the same as Option C (Kustomize) — only the final deploy step differs.
+
+#### 1. Install Prerequisites
+
+OSAC requires several operators to be present on the cluster. The prerequisite manifests
+are located in the `prerequisites/` directory. Install them in order:
+
+```bash
+# cert-manager
+oc apply -k prerequisites/cert-manager/
+oc wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=300s
+oc wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=300s
+
+# trust-manager
+oc apply -f prerequisites/trust-manager.yaml
+oc wait --for=condition=Available deployment/trust-manager -n cert-manager --timeout=300s
+
+# CA issuer
+oc apply -f prerequisites/ca-issuer.yaml
+
+# Authorino operator
+oc apply -f prerequisites/authorino-operator.yaml
+
+# Keycloak
+oc apply -k prerequisites/keycloak/
+oc wait --for=condition=Available deployment/keycloak-service -n keycloak --timeout=600s
+
+# AAP operator
+oc apply -f prerequisites/aap-installation.yaml
+```
+
+Wait for each operator to be ready before proceeding. See
+[prerequisites/README.md](prerequisites/README.md) for details on optional
+components (LVMS, MetalLB, MCE, OpenShift Virtualization).
+
+#### 2. Initialize Submodules
+
+```bash
+git submodule update --init --recursive --remote
+```
+
+#### 3. Build Chart Dependencies
+
+```bash
+helm dependency build charts/osac/
+```
+
+#### 4. Configure Values
+
+Copy and customize a values file for your environment:
+
+```bash
+cp values/development.yaml values/<project-name>.yaml
+# Edit values/<project-name>.yaml to set:
+#   - operator.aap.url: your AAP controller URL
+#   - service.auth.issuerUrl: your Keycloak realm URL
+#   - service.idp.url: your Keycloak base URL
+#   - service.database.connection: your PostgreSQL connection details
+```
+
+#### 5. Validate (Dry-Run)
+
+```bash
+# Lint the chart
+helm lint charts/osac/
+
+# Render templates without deploying
+helm template osac charts/osac/ --values values/<project-name>.yaml > /dev/null
+```
+
+#### 6. Deploy
+
+```bash
+helm upgrade --install osac charts/osac/ \
+  --namespace <project-name> \
+  --create-namespace \
+  --values values/<project-name>.yaml \
+  --timeout 40m \
+  --wait
+```
+
+#### 7. Verify
+
+```bash
+# Check deployment status
+helm status osac -n <project-name>
+
+# Check running pods
+kubectl get pods -n <project-name>
+
+# Monitor the AAP bootstrap job (runs as a post-install hook)
+kubectl logs -f job/osac-aap-bootstrap -n <project-name>
+```
+
+#### 8. Post-Install
+
+After the AAP bootstrap job completes, run the post-install scripts:
+
+```bash
+INSTALLER_NAMESPACE=<project-name> ./scripts/prepare-aap.sh
+INSTALLER_NAMESPACE=<project-name> ./scripts/prepare-fulfillment-service.sh
+INSTALLER_NAMESPACE=<project-name> ./scripts/prepare-tenant.sh
+```
+
+#### Upgrading
+
+```bash
+helm upgrade osac charts/osac/ \
+  --namespace <project-name> \
+  --values values/<project-name>.yaml \
+  --timeout 40m \
+  --wait
+```
+
+#### Uninstalling
+
+```bash
+helm uninstall osac -n <project-name>
+```
+
+> **Note:** CRDs are preserved after uninstall (they have the
+> `helm.sh/resource-policy: keep` annotation). To remove them manually:
+> `oc delete crd -l app.kubernetes.io/part-of=osac`
+
+#### Makefile Targets
+
+For convenience, the `Makefile` provides developer targets:
+
+```bash
+make helm-deps       # Build chart dependencies
+make helm-lint       # Lint the umbrella chart
+make helm-template   # Dry-run render all templates
+make helm-validate   # Lint + template (full validation)
+make helm-deploy     # Deploy to current cluster
+make helm-undeploy   # Uninstall from current cluster
+make sync-charts     # Update submodules + rebuild dependencies
+make setup           # Run setup.sh with DEPLOY_MODE=helm
+```
+
+### Option C: Manual Kustomize Installation (Legacy)
+
+If you prefer to install step-by-step using Kustomize, or need to install individual
+prerequisites, follow the manual process below.
 
 #### Install Required Operators
 

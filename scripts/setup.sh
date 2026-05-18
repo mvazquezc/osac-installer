@@ -302,10 +302,15 @@ else
 fi
 wait_for_resource deployment/osac-console-proxy condition=Available 300 "${CONSOLE_PROXY_NS}"
 
+# Wait for AAP bootstrap job to complete.
+# In kustomize mode, the job is named "aap-bootstrap".
+# In helm mode, the job is a post-install hook named "osac-aap-bootstrap".
+# helm --wait does not wait for hook jobs, so we must wait explicitly.
+echo "Waiting for AAP bootstrap job to complete (this may take up to 40 minutes)..."
 if [[ "${DEPLOY_MODE}" == "kustomize" ]]; then
-    # In kustomize mode, wait for bootstrap job (in helm mode, this is a hook)
-    echo "Waiting for AAP bootstrap job to complete (this may take up to 40 minutes)..."
     wait_for_resource job/aap-bootstrap condition=complete 2400 "${INSTALLER_NAMESPACE}"
+else
+    wait_for_resource job/osac-aap-bootstrap condition=complete 2400 "${INSTALLER_NAMESPACE}"
 fi
 
 # Wait for Authorino to be ready (gRPC auth depends on it)
