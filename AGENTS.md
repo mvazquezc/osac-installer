@@ -113,7 +113,13 @@ for d in overlays/*/; do kustomize build "$d" > "/tmp/after-$(basename $d).yaml"
 - **Replacements in Components run before the namespace transformer** -- a replacement that sets `metadata.namespace: kube-system` inside a Component will be overwritten by the overlay's namespace transformer. Replacements that fix namespace fields must live at the overlay level.
 - **Kustomize blocks `../` in file paths** -- replacements files cannot reference parent directories. Each overlay that needs replacements must have its own copy.
 - **Embedded namespace references** -- `APIService.spec.service.namespace`, `cert-manager.io/inject-ca-from` annotations, and Certificate `dnsNames` embed namespaces that the transformer cannot update. These require kustomize replacements with `delimiter`/`index` fields.
-- **`ca-trust-bundle.yaml` is cluster-scoped** -- each overlay's Bundle must use a unique name (`ca-bundle-<namespace>`) to avoid collisions on shared clusters. The `namespaceSelector` targets only that overlay's namespace. When creating a new overlay, copy `ca-trust-bundle.yaml` from an existing overlay, update `metadata.name` to `ca-bundle-<your-namespace>`, and update the `values` list to your namespace.
+- **`ca-bundle` Bundle is cluster-scoped and managed by `setup.sh`** -- trust-manager names the generated ConfigMap after the Bundle, so it must stay named `ca-bundle` (pods mount this ConfigMap by name). The Bundle is **not** applied via kustomize -- `setup.sh` creates it on first deploy and additively patches the namespace selector on subsequent deploys, so it never overwrites other developers' namespaces. For manual deployments, patch the selector to add your namespace:
+  ```bash
+  oc patch bundle ca-bundle --type=json -p '[
+    {"op":"add","path":"/spec/target/namespaceSelector/matchExpressions/0/values/-","value":"<your-namespace>"}
+  ]'
+  ```
+  Or run `scripts/ensure-ca-bundle.sh <your-namespace>` which handles both creation and patching.
 
 ## Shared Cluster Constraints
 

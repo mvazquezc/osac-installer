@@ -16,7 +16,6 @@ labels:
 
 resources:
 - ../../base
-- ./ca-trust-bundle.yaml
 
 generatorOptions:
   disableNameSuffixHash: true
