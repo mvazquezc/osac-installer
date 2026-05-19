@@ -32,7 +32,7 @@ for ns in "${INSTALLER_NAMESPACE}" "${KEYCLOAK_NS}"; do
             ROUTE_NAME=$(echo "${OLD_HOST}" | sed "s/\.${ROUTE_DOMAIN}$//")
             NEW_HOST="${ROUTE_NAME}.${CLUSTER_DOMAIN}"
             echo "  ${ns}/${route}: ${OLD_HOST} -> ${NEW_HOST}"
-            oc patch route "${route}" -n "${ns}" --type=merge -p "{\"spec\":{\"host\":\"${NEW_HOST}\"}}"
+            retry_command 300 10 oc patch route "${route}" -n "${ns}" --type=merge -p "{\"spec\":{\"host\":\"${NEW_HOST}\"}}"
         fi
     done
 done
@@ -109,6 +109,14 @@ oc create secret generic fulfillment-controller-credentials \
 echo "  Credentials created for client: ${FC_CLIENT_ID}"
 
 echo "[4/9] Applying kustomize overlay..."
+echo "  Checking trust-manager readiness..."
+echo "  trust-manager pods:"
+oc get pods -n cert-manager -l app.kubernetes.io/name=trust-manager --no-headers 2>/dev/null || echo "    (none found)"
+echo "  trust-manager endpoints:"
+oc get endpoints trust-manager -n cert-manager --no-headers 2>/dev/null || echo "    (none found)"
+echo "  Waiting for trust-manager rollout..."
+oc rollout status deploy/trust-manager -n cert-manager --timeout=300s
+echo "  trust-manager ready"
 oc delete job -n "${INSTALLER_NAMESPACE}" --all --ignore-not-found
 oc apply -k "overlays/${INSTALLER_KUSTOMIZE_OVERLAY}"
 
