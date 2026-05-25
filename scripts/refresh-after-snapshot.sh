@@ -58,108 +58,183 @@ fi
 echo "Cluster services ready"
 echo ""
 
-echo "[1/8] Syncing Keycloak realm..."
-NEW_HASH=$(md5sum "${REALM_JSON}" | awk '{print $1}')
-OLD_HASH=$(oc get configmap keycloak-realm -n "${KEYCLOAK_NS}" -o jsonpath='{.data.realm\.json}' 2>/dev/null | md5sum | awk '{print $1}')
-if [[ "${NEW_HASH}" != "${OLD_HASH}" ]]; then
-    echo "  ConfigMap changed (${OLD_HASH:0:8} -> ${NEW_HASH:0:8}), restarting Keycloak..."
-    oc create configmap keycloak-realm \
-        --from-file=realm.json="${REALM_JSON}" \
-        -n "${KEYCLOAK_NS}" --dry-run=client -o yaml | oc apply -f -
-    oc rollout restart deploy/keycloak-service -n "${KEYCLOAK_NS}"
-    oc rollout status deploy/keycloak-service -n "${KEYCLOAK_NS}" --timeout=300s
-else
-    echo "  ConfigMap unchanged, skipping Keycloak restart"
-fi
+# Keycloak sync and fulfillment credentials run in parallel.
+# Credentials read from realm.json (local file) — no dependency on Keycloak being up.
+# Kustomize apply needs the credentials secret, so we wait for it before proceeding.
 
-KC_URL="https://$(oc get route keycloak -n "${KEYCLOAK_NS}" -o jsonpath='{.spec.host}')"
-retry_until 60 5 '[[ "$(curl -sk -o /dev/null -w %{http_code} '"${KC_URL}"'/realms/osac)" == "200" ]]' || {
-    echo "Timed out waiting for Keycloak"
-    exit 1
+keycloak_sync() {
+    echo "[1/8] Syncing Keycloak realm..."
+    NEW_HASH=$(md5sum "${REALM_JSON}" | awk '{print $1}')
+    OLD_HASH=$(oc get configmap keycloak-realm -n "${KEYCLOAK_NS}" -o jsonpath='{.data.realm\.json}' 2>/dev/null | md5sum | awk '{print $1}')
+    if [[ "${NEW_HASH}" != "${OLD_HASH}" ]]; then
+        echo "  ConfigMap changed (${OLD_HASH:0:8} -> ${NEW_HASH:0:8}), restarting Keycloak..."
+        oc create configmap keycloak-realm \
+            --from-file=realm.json="${REALM_JSON}" \
+            -n "${KEYCLOAK_NS}" --dry-run=client -o yaml | oc apply -f -
+        oc rollout restart deploy/keycloak-service -n "${KEYCLOAK_NS}"
+        oc rollout status deploy/keycloak-service -n "${KEYCLOAK_NS}" --timeout=300s
+    else
+        echo "  ConfigMap unchanged, skipping Keycloak restart"
+    fi
+
+    KC_URL="https://$(oc get route keycloak -n "${KEYCLOAK_NS}" -o jsonpath='{.spec.host}')"
+    retry_until 60 5 '[[ "$(curl -sk -o /dev/null -w %{http_code} '"${KC_URL}"'/realms/osac)" == "200" ]]' || {
+        echo "Timed out waiting for Keycloak"
+        exit 1
+    }
+    KC_ADMIN_TOKEN=$(curl -sk "${KC_URL}/realms/master/protocol/openid-connect/token" \
+        -d "client_id=admin-cli" -d "username=admin" -d "password=admin" -d "grant_type=password" | jq -r '.access_token')
+    [[ -n "${KC_ADMIN_TOKEN}" && "${KC_ADMIN_TOKEN}" != "null" ]] || { echo "ERROR: Could not get Keycloak admin token" >&2; exit 1; }
+
+    echo "  Syncing clients and users via admin API..."
+    jq -c '.clients[] | select(.protocol == "openid-connect" and .publicClient != true and .bearerOnly != true)' "${REALM_JSON}" | while IFS= read -r CLIENT_JSON; do
+        CID=$(echo "${CLIENT_JSON}" | jq -r '.clientId')
+        CLIENT_UUID=$(echo "${CLIENT_JSON}" | jq -r '.id')
+        HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" "${KC_URL}/admin/realms/osac/clients/${CLIENT_UUID}")
+        if [[ "${HTTP_CODE}" == "200" ]]; then
+            curl -sk -X PUT -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
+                "${KC_URL}/admin/realms/osac/clients/${CLIENT_UUID}" -d "${CLIENT_JSON}" >/dev/null
+            echo "  Updated client: ${CID}"
+        else
+            curl -sk -X POST -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
+                "${KC_URL}/admin/realms/osac/clients" -d "${CLIENT_JSON}" >/dev/null
+            echo "  Created client: ${CID}"
+        fi
+    done
+
+    jq -c '.users[]?' "${REALM_JSON}" | while IFS= read -r USER_JSON; do
+        USERNAME=$(echo "${USER_JSON}" | jq -r '.username')
+        USER_UUID=$(echo "${USER_JSON}" | jq -r '.id')
+        HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" "${KC_URL}/admin/realms/osac/users/${USER_UUID}")
+        if [[ "${HTTP_CODE}" == "200" ]]; then
+            curl -sk -X PUT -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
+                "${KC_URL}/admin/realms/osac/users/${USER_UUID}" -d "${USER_JSON}" >/dev/null
+            echo "  Updated user: ${USERNAME}"
+        else
+            curl -sk -X POST -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
+                "${KC_URL}/admin/realms/osac/users" -d "${USER_JSON}" >/dev/null
+            echo "  Created user: ${USERNAME}"
+        fi
+    done
+
+    if [[ -f prerequisites/keycloak/service/password-setup-job.yaml ]]; then
+        oc delete job keycloak-set-passwords -n "${KEYCLOAK_NS}" --ignore-not-found
+        oc apply -f prerequisites/keycloak/service/password-setup-job.yaml -n "${KEYCLOAK_NS}"
+        oc wait --for=condition=Complete job/keycloak-set-passwords -n "${KEYCLOAK_NS}" --timeout=300s
+    fi
+    echo "[1/8] Keycloak sync complete"
 }
-KC_ADMIN_TOKEN=$(curl -sk "${KC_URL}/realms/master/protocol/openid-connect/token" \
-    -d "client_id=admin-cli" -d "username=admin" -d "password=admin" -d "grant_type=password" | jq -r '.access_token')
-[[ -n "${KC_ADMIN_TOKEN}" && "${KC_ADMIN_TOKEN}" != "null" ]] || { echo "ERROR: Could not get Keycloak admin token" >&2; exit 1; }
 
-echo "  Syncing clients and users via admin API..."
-jq -c '.clients[] | select(.protocol == "openid-connect" and .publicClient != true and .bearerOnly != true)' "${REALM_JSON}" | while IFS= read -r CLIENT_JSON; do
-    CID=$(echo "${CLIENT_JSON}" | jq -r '.clientId')
-    CLIENT_UUID=$(echo "${CLIENT_JSON}" | jq -r '.id')
-    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" "${KC_URL}/admin/realms/osac/clients/${CLIENT_UUID}")
-    if [[ "${HTTP_CODE}" == "200" ]]; then
-        curl -sk -X PUT -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
-            "${KC_URL}/admin/realms/osac/clients/${CLIENT_UUID}" -d "${CLIENT_JSON}" >/dev/null
-        echo "  Updated client: ${CID}"
-    else
-        curl -sk -X POST -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
-            "${KC_URL}/admin/realms/osac/clients" -d "${CLIENT_JSON}" >/dev/null
-        echo "  Created client: ${CID}"
-    fi
-done
+create_fulfillment_credentials() {
+    echo "[2/8] Recreating fulfillment controller credentials..."
+    FC_CLIENT_ID=$(jq -er '.clients[] | select(.serviceAccountsEnabled == true) | .clientId' "${REALM_JSON}")
+    FC_CLIENT_SECRET=$(jq -er ".clients[] | select(.clientId == \"${FC_CLIENT_ID}\") | .secret // empty" "${REALM_JSON}")
+    [[ -n "${FC_CLIENT_SECRET}" ]] || { echo "ERROR: Could not resolve secret for ${FC_CLIENT_ID} in realm.json" >&2; exit 1; }
+    oc delete secret fulfillment-controller-credentials -n "${INSTALLER_NAMESPACE}" --ignore-not-found
+    oc create secret generic fulfillment-controller-credentials \
+        --from-literal=client-id="${FC_CLIENT_ID}" \
+        --from-literal=client-secret="${FC_CLIENT_SECRET}" \
+        -n "${INSTALLER_NAMESPACE}"
+    echo "[2/8] Credentials created for client: ${FC_CLIENT_ID}"
+}
 
-jq -c '.users[]?' "${REALM_JSON}" | while IFS= read -r USER_JSON; do
-    USERNAME=$(echo "${USER_JSON}" | jq -r '.username')
-    USER_UUID=$(echo "${USER_JSON}" | jq -r '.id')
-    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" "${KC_URL}/admin/realms/osac/users/${USER_UUID}")
-    if [[ "${HTTP_CODE}" == "200" ]]; then
-        curl -sk -X PUT -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
-            "${KC_URL}/admin/realms/osac/users/${USER_UUID}" -d "${USER_JSON}" >/dev/null
-        echo "  Updated user: ${USERNAME}"
-    else
-        curl -sk -X POST -H "Authorization: Bearer ${KC_ADMIN_TOKEN}" -H "Content-Type: application/json" \
-            "${KC_URL}/admin/realms/osac/users" -d "${USER_JSON}" >/dev/null
-        echo "  Created user: ${USERNAME}"
-    fi
-done
+keycloak_sync &
+pid_kc_sync=$!
+create_fulfillment_credentials &
+pid_creds=$!
 
-if [[ -f prerequisites/keycloak/service/password-setup-job.yaml ]]; then
-    oc delete job keycloak-set-passwords -n "${KEYCLOAK_NS}" --ignore-not-found
-    oc apply -f prerequisites/keycloak/service/password-setup-job.yaml -n "${KEYCLOAK_NS}"
-    oc wait --for=condition=Complete job/keycloak-set-passwords -n "${KEYCLOAK_NS}" --timeout=300s
-fi
-
-echo "[2/8] Recreating fulfillment controller credentials..."
-FC_CLIENT_ID=$(jq -er '.clients[] | select(.serviceAccountsEnabled == true) | .clientId' "${REALM_JSON}")
-FC_CLIENT_SECRET=$(jq -er ".clients[] | select(.clientId == \"${FC_CLIENT_ID}\") | .secret // empty" "${REALM_JSON}")
-[[ -n "${FC_CLIENT_SECRET}" ]] || { echo "ERROR: Could not resolve secret for ${FC_CLIENT_ID} in realm.json" >&2; exit 1; }
-oc delete secret fulfillment-controller-credentials -n "${INSTALLER_NAMESPACE}" --ignore-not-found
-oc create secret generic fulfillment-controller-credentials \
-    --from-literal=client-id="${FC_CLIENT_ID}" \
-    --from-literal=client-secret="${FC_CLIENT_SECRET}" \
-    -n "${INSTALLER_NAMESPACE}"
-echo "  Credentials created for client: ${FC_CLIENT_ID}"
+failed=0
+wait ${pid_creds} || failed=1
+if (( failed )); then echo "ERROR: Failed to create fulfillment credentials"; exit 1; fi
 
 echo "[3/8] Applying kustomize overlay..."
 oc delete job -n "${INSTALLER_NAMESPACE}" --all --ignore-not-found
+# Exclude the AnsibleAutomationPlatform CR and bootstrap job from the apply.
+# Both already exist on the cluster from the snapshot. Re-applying the CR
+# triggers the AAP operator to reconcile and roll the controller-task
+# deployment, killing in-flight AAP jobs. The bootstrap job is redundant
+# on snapshot boot (AAP is already configured) and races the operator.
+# NOTE: if aap.yaml or job.yaml change, the snapshot must be recreated.
+sed -i '/aap\.yaml/d; /job\.yaml/d' base/osac-aap/config/base/kustomization.yaml
 oc apply -k "overlays/${INSTALLER_KUSTOMIZE_OVERLAY}"
 
-echo "[4/8] Waiting for fulfillment rollouts..."
+# After recert, cert-manager reissues TLS certificates with the new cluster CA.
+# Pods that start before certs are ready crash loading the CA file. Wait for all
+# certificates to be reissued, then restart pods so they mount fresh secrets.
+# CDI webhook certs are managed by the CDI operator (not cert-manager). The CDI
+# operator renews the signer but doesn't re-issue server certs from it. Delete
+# the stale server certs so the operator recreates them with the new signer.
+echo "[4/8] Waiting for TLS certificates and restarting pods..."
+for secret in cdi-apiserver-server-cert cdi-uploadproxy-server-cert; do
+    oc delete secret "${secret}" -n openshift-cnv --ignore-not-found
+done
 pids=()
-for deploy in fulfillment-controller fulfillment-grpc-server fulfillment-rest-gateway fulfillment-ingress-proxy; do
-    oc rollout status "deploy/${deploy}" -n "${INSTALLER_NAMESPACE}" --timeout=300s &
+for cert in authorino fulfillment-controller fulfillment-grpc-server fulfillment-api \
+            fulfillment-rest-gateway fulfillment-database-client fulfillment-database-server \
+            osac-console-proxy; do
+    oc wait --for=condition=Ready "certificate.cert-manager.io/${cert}" -n "${INSTALLER_NAMESPACE}" --timeout=300s &
     pids+=($!)
 done
 failed=0
 for pid in "${pids[@]}"; do wait "${pid}" || failed=1; done
-if (( failed )); then echo "ERROR: Fulfillment rollout failed"; exit 1; fi
+if (( failed )); then echo "ERROR: TLS certificates not ready"; exit 1; fi
+echo "[4/8] TLS certificates ready, restarting fulfillment pods..."
+for deploy in fulfillment-controller fulfillment-grpc-server fulfillment-rest-gateway fulfillment-ingress-proxy; do
+    oc rollout restart "deploy/${deploy}" -n "${INSTALLER_NAMESPACE}"
+done
 
-echo "[5/8] Applying AAP configuration..."
-INSTALLER_NAMESPACE="${INSTALLER_NAMESPACE}" \
-INSTALLER_KUSTOMIZE_OVERLAY="${INSTALLER_KUSTOMIZE_OVERLAY}" \
-    ./scripts/aap-configuration.sh
+# Fulfillment rollouts, AAP configuration, and AAP controller wait run in parallel.
+# Keycloak sync from above also continues in the background.
+
+wait_fulfillment_rollouts() {
+    pids=()
+    for deploy in fulfillment-controller fulfillment-grpc-server fulfillment-rest-gateway fulfillment-ingress-proxy; do
+        oc rollout status "deploy/${deploy}" -n "${INSTALLER_NAMESPACE}" --timeout=300s &
+        pids+=($!)
+    done
+    local failed=0
+    for pid in "${pids[@]}"; do wait "${pid}" || failed=1; done
+    if (( failed )); then echo "ERROR: Fulfillment rollout failed"; exit 1; fi
+    echo "[4/8] Fulfillment rollouts complete"
+}
+
+apply_aap_configuration() {
+    echo "[5/8] Applying AAP configuration..."
+    INSTALLER_NAMESPACE="${INSTALLER_NAMESPACE}" \
+    INSTALLER_KUSTOMIZE_OVERLAY="${INSTALLER_KUSTOMIZE_OVERLAY}" \
+        ./scripts/aap-configuration.sh
+    echo "[5/8] AAP configuration applied"
+}
+
+wait_aap_controller() {
+    echo "[6/8] Waiting for AAP controller..."
+    retry_until 300 10 '[[ "$(oc get automationcontroller osac-aap-controller -n '"${INSTALLER_NAMESPACE}"' -o jsonpath='"'"'{.status.conditions[?(@.type=="Running")].status}'"'"' 2>/dev/null)" == "True" ]]' || {
+        echo "Timed out waiting for AAP controller to be Running"
+        exit 1
+    }
+    AAP_ROUTE_HOST=$(oc get route osac-aap -n "${INSTALLER_NAMESPACE}" -o jsonpath='{.spec.host}')
+    retry_until 120 5 '[[ "$(curl -sk -o /dev/null -w %{http_code} https://'"${AAP_ROUTE_HOST}"'/api/gateway/v1/)" == "200" ]]' || {
+        echo "Timed out waiting for AAP gateway API to respond"
+        exit 1
+    }
+    echo "[6/8] AAP controller Running, gateway responding"
+}
+
+wait_fulfillment_rollouts &
+pid_fulfill=$!
+apply_aap_configuration &
+pid_aapconf=$!
+wait_aap_controller &
+pid_aapwait=$!
+
+failed=0
+wait ${pid_fulfill} || failed=1
+if (( failed )); then echo "ERROR: Fulfillment rollout failed"; exit 1; fi
+wait ${pid_aapconf} || { echo "ERROR: AAP configuration failed"; exit 1; }
+wait ${pid_aapwait} || { echo "ERROR: AAP controller wait failed"; exit 1; }
+wait ${pid_kc_sync} || { echo "ERROR: Keycloak sync failed"; exit 1; }
 
 oc config set-context --current --namespace="${INSTALLER_NAMESPACE}"
-
-echo "[6/8] Waiting for AAP controller..."
-retry_until 300 10 '[[ "$(oc get automationcontroller osac-aap-controller -n '"${INSTALLER_NAMESPACE}"' -o jsonpath='"'"'{.status.conditions[?(@.type=="Running")].status}'"'"' 2>/dev/null)" == "True" ]]' || {
-    echo "Timed out waiting for AAP controller to be Running"
-    exit 1
-}
-AAP_ROUTE_HOST=$(oc get route osac-aap -n "${INSTALLER_NAMESPACE}" -o jsonpath='{.spec.host}')
-retry_until 120 5 '[[ "$(curl -sk -o /dev/null -w %{http_code} https://'"${AAP_ROUTE_HOST}"'/api/gateway/v1/)" == "200" ]]' || {
-    echo "Timed out waiting for AAP gateway API to respond"
-    exit 1
-}
 
 echo "[7/8] Configuring AAP access and fulfillment service..."
 ./scripts/prepare-aap.sh
