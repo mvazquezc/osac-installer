@@ -214,12 +214,16 @@ refresh_cdi_certificates() {
         oc delete secret "${secret}" -n openshift-cnv --ignore-not-found
     done
     oc delete pod -n openshift-cnv -l app=cdi-operator --ignore-not-found
-    oc rollout status deploy/cdi-operator -n openshift-cnv --timeout=300s
+    retry_command 300 10 oc rollout status deploy/cdi-operator -n openshift-cnv --timeout=120s
     for deploy in cdi-deployment cdi-apiserver cdi-uploadproxy; do
         oc rollout restart "deploy/${deploy}" -n openshift-cnv 2>/dev/null || true
     done
-    oc rollout status deploy/cdi-deployment -n openshift-cnv --timeout=300s
-    oc rollout status deploy/cdi-apiserver -n openshift-cnv --timeout=300s
+    retry_command 300 10 oc rollout status deploy/cdi-deployment -n openshift-cnv --timeout=120s &
+    local pid_cdi_deploy=$!
+    retry_command 300 10 oc rollout status deploy/cdi-apiserver -n openshift-cnv --timeout=120s &
+    local pid_cdi_api=$!
+    wait ${pid_cdi_deploy}
+    wait ${pid_cdi_api}
     echo "  CDI certificates refreshed"
 }
 
@@ -234,8 +238,8 @@ refresh_metallb_certificates() {
     oc delete secret metallb-operator-webhook-server-cert -n metallb-system --ignore-not-found
     oc delete pod -n metallb-system -l control-plane=controller-manager --ignore-not-found 2>/dev/null || true
     oc delete pod -n metallb-system -l component=webhook-server --ignore-not-found 2>/dev/null || true
-    retry_until 120 5 '[[ "$(oc get deploy metallb-operator-webhook-server -n metallb-system -o jsonpath='"'"'{.status.readyReplicas}'"'"' 2>/dev/null)" == "1" ]]' || {
-        echo "WARNING: MetalLB webhook server did not become ready, continuing anyway"
+    retry_until 120 5 '[[ -n "$(oc get endpoints metallb-operator-webhook-server-service -n metallb-system -o jsonpath='"'"'{.subsets[*].addresses[*].ip}'"'"' 2>/dev/null)" ]]' || {
+        echo "WARNING: MetalLB webhook service has no endpoints, continuing anyway"
     }
     echo "  MetalLB webhook certificates refreshed"
 }
@@ -247,7 +251,8 @@ if oc get crd ipaddresspools.metallb.io &>/dev/null; then
     NODE_IP=$(oc get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
     SUBNET_PREFIX=$(echo "${NODE_IP}" | cut -d. -f1-3)
     echo "  Node IP: ${NODE_IP}, configuring pool: ${SUBNET_PREFIX}.240-${SUBNET_PREFIX}.250"
-    cat <<METALLBEOF | oc apply -f -
+    METALLB_YAML=$(mktemp)
+    cat > "${METALLB_YAML}" <<METALLBEOF
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
@@ -258,6 +263,7 @@ spec:
     - ${SUBNET_PREFIX}.240-${SUBNET_PREFIX}.250
   autoAssign: true
 METALLBEOF
+    retry_command 120 10 oc apply -f "${METALLB_YAML}"
 else
     echo "  MetalLB not installed, skipping"
 fi
